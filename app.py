@@ -68,13 +68,41 @@ def load_blip_assets():
     return blip_processor, blip_model, device
 
 
+def _get_expected_seq_len(model, fallback):
+    try:
+        inp_shape = model.input_shape
+        if isinstance(inp_shape, (list, tuple)) and len(inp_shape) >= 2:
+            seq_shape = inp_shape[1]
+            if isinstance(seq_shape, (list, tuple)) and len(seq_shape) >= 2 and seq_shape[1]:
+                return int(seq_shape[1])
+    except Exception:
+        pass
+    return int(fallback)
+
+
+def _predict_step(model, features, padded):
+    try:
+        out = model.predict([features, padded], verbose=0)
+    except ValueError:
+        input_names = getattr(model, "input_names", None)
+        if input_names and len(input_names) >= 2:
+            out = model.predict(
+                {input_names[0]: features, input_names[1]: padded}, verbose=0
+            )
+        else:
+            raise
+    if isinstance(out, (list, tuple)):
+        out = out[0]
+    return out[0].astype(np.float64)
+
+
 def generate_custom_caption(
     model,
     tokenizer,
     index_to_word,
     features,
     max_length,
-    temperature=0.2,
+    temperature=0.25,
     beam_width=2,
     rep_penalty=0.25,
 ):
@@ -83,15 +111,20 @@ def generate_custom_caption(
     if start_id is None:
         return "", []
 
+    expected_len = _get_expected_seq_len(model, max_length)
+    step_limit = min(int(max_length), expected_len)
+
     beams = [([start_id], 0.0, [])]
     completed = []
 
-    for _ in range(max_length):
+    for _ in range(step_limit):
         candidates = []
 
         for seq, score, confs in beams:
-            padded = pad_sequences([seq], maxlen=max_length, padding="post")
-            preds = model.predict([features, padded], verbose=0)[0].astype(np.float64)
+            padded = pad_sequences(
+                [seq[:expected_len]], maxlen=expected_len, padding="post"
+            )
+            preds = _predict_step(model, features, padded)
             del padded
 
             if start_id < len(preds):
@@ -160,8 +193,13 @@ def generate_custom_caption(
 
 
 st.sidebar.header("⚙️ Advanced Settings")
+model_mode = st.sidebar.radio(
+    "Model Execution Mode (saves RAM)",
+    ["Spatial BLIP Only", "Custom ResNet152 + BiLSTM Only", "Both (High RAM)"],
+    index=0,
+)
 max_length = st.sidebar.slider(
-    "Max Caption Length", min_value=10, max_value=40, value=20
+    "Max Caption Length", min_value=10, max_value=34, value=18
 )
 temperature = st.sidebar.slider(
     "Sampling Temperature", min_value=0.1, max_value=1.0, value=0.25
@@ -182,60 +220,12 @@ if uploaded_file is not None:
 
     with col2:
         if st.button("Generate & Analyze Captions 🚀"):
-            with st.spinner("Loading models & generating captions..."):
-                custom_model, tokenizer, index_to_word, resnet_extractor = load_custom_assets()
+            custom_caption = None
+            word_confidences = []
+            blip_caption = None
 
-                img_resized = image.resize((224, 224))
-                arr = np.expand_dims(
-                    np.array(img_resized, dtype=np.float32), axis=0
-                )
-                arr = preprocess_input(arr)
-                features = resnet_extractor.predict(arr, verbose=0)
-                del img_resized, arr
-
-                custom_caption, word_confidences = generate_custom_caption(
-                    custom_model,
-                    tokenizer,
-                    index_to_word,
-                    features,
-                    max_length=max_length,
-                    temperature=temperature,
-                    beam_width=2,
-                    rep_penalty=0.25,
-                )
-                del features
-
-                blip_processor, blip_model, device = load_blip_assets()
-                inputs = blip_processor(image, return_tensors="pt").to(device)
-                with torch.inference_mode():
-                    out = blip_model.generate(**inputs, max_new_tokens=30)
-                blip_caption = blip_processor.decode(
-                    out[0], skip_special_tokens=True
-                ).strip()
-                del inputs, out
-                gc.collect()
-
-            st.success("Analysis Complete!")
-
-            tab1, tab2 = st.tabs(["🤖 Model Captions", "📊 Confidence Metrics"])
-
-            with tab1:
-                c1, c2 = st.columns(2)
-                with c1:
-                    st.info("**Custom ResNet152 + BiLSTM**")
-                    st.write(custom_caption)
-                    st.code(custom_caption, language="text")
-                with c2:
-                    st.success("**Spatial BLIP Model**")
-                    st.write(blip_caption)
-                    st.code(blip_caption, language="text")
-
-            with tab2:
-                st.markdown("#### Word-by-Word Prediction Confidence (Custom Model)")
-                if word_confidences:
-                    for w, c in word_confidences:
-                        st.write(f"**{w}** — `{c * 100:.2f}%`")
-                else:
-                    st.write("No confidence metrics available.")
-else:
-    st.info("👈 Upload an image from the sidebar to get started.")
+            with st.spinner("Running selected model(s)..."):
+                if model_mode in ("Custom ResNet152 + BiLSTM Only", "Both (High RAM)"):
+                    custom_model, tokenizer, index_to_word, resnet_extractor = load_custom_assets()
+                    img_resized = image.resize((224, 224))
+                    arr =
